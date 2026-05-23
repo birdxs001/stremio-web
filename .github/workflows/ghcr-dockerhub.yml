@@ -7,6 +7,10 @@ on:
         description: 'Image tag version (e.g., v1.0.0, latest)'
         required: true
         default: 'latest'
+# ✅ 添加全局权限
+permissions:
+  contents: read
+  packages: write   # 允许推送到 GHCR        
 
 env:
   GHCR_REGISTRY: ghcr.io
