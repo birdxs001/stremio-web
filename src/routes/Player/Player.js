@@ -1,16 +1,18 @@
 // Copyright (C) 2017-2023 Smart code 203358507
 
 const React = require('react');
-const PropTypes = require('prop-types');
+const { useParams, useNavigate } = require('react-router');
+const { useSearchParams } = require('react-router-dom');
 const classnames = require('classnames');
 const debounce = require('lodash.debounce');
 const langs = require('langs');
 const { useTranslation } = require('react-i18next');
-const { useRouteFocused } = require('stremio-router');
+const { default: useRouteFocused } = require('stremio/common/useRouteFocused');
 const { useCore } = require('stremio/core');
 const { useServices, useGamepad } = require('stremio/services');
 const { useContentGamepadNavigation } = require('stremio/services/GamepadNavigation');
-const { useSettings, useProfile, useFullscreen, useBinaryState, useToast, useStreamingServer, withCoreSuspender, usePlatform, onShortcut } = require('stremio/common');
+const { useSettings, useProfile, useFullscreen, useBinaryState, useToast, useStreamingServer, withCoreSuspender, usePlatform, onShortcut, useDiscord, EMPTY_DISCORD_TIMESTAMPS, getPlaybackDiscordActivity } = require('stremio/common');
+const { default: toPath } = require('stremio-router/toPath');
 const { HorizontalNavBar, Transition, ContextMenu } = require('stremio/components');
 const { default: Buffering } = require('./Buffering');
 const VolumeChangeIndicator = require('./VolumeChangeIndicator');
@@ -38,7 +40,18 @@ const findTrackById = (tracks, id) => tracks.find((track) => track.id === id);
 
 const GAMEPAD_HANDLER_ID = 'player';
 
-const Player = ({ urlParams, queryParams }) => {
+const Player = () => {
+    const { stream, streamTransportUrl, metaTransportUrl, type, id, videoId } = useParams();
+    const urlParams = React.useMemo(() => ({
+        stream,
+        streamTransportUrl,
+        metaTransportUrl,
+        type,
+        id,
+        videoId
+    }), [stream, streamTransportUrl, metaTransportUrl, type, id, videoId]);
+    const [queryParams] = useSearchParams();
+    const navigate = useNavigate();
     const { t } = useTranslation();
     const services = useServices();
     const core = useCore();
@@ -55,6 +68,8 @@ const Player = ({ urlParams, queryParams }) => {
     const routeFocused = useRouteFocused();
     const platform = usePlatform();
     const toast = useToast();
+    const discord = useDiscord();
+    const discordTimestamps = React.useRef(EMPTY_DISCORD_TIMESTAMPS);
 
     const [seeking, setSeeking] = React.useState(false);
 
@@ -124,8 +139,6 @@ const Player = ({ urlParams, queryParams }) => {
     const playingOnExternalDevice = React.useRef(false);
     const [error, setError] = React.useState(null);
 
-    const isNavigating = React.useRef(false);
-
     const VIDEO_SCALES = ['contain', 'cover', 'fill'];
     const VIDEO_SCALE_LABELS = { contain: t('PLAYER_SCALE_FIT'), cover: t('PLAYER_SCALE_CROP'), fill: t('PLAYER_SCALE_STRETCH') };
 
@@ -140,44 +153,34 @@ const Player = ({ urlParams, queryParams }) => {
         if (ended) {
             if (bingeWatching) {
                 if (deepLinks.player) {
-                    isNavigating.current = true;
-                    window.location.replace(deepLinks.player);
+                    navigate(toPath(deepLinks.player), { replace: true });
                 } else if (deepLinks.metaDetailsStreams) {
-                    isNavigating.current = true;
-                    window.location.replace(deepLinks.metaDetailsStreams);
+                    navigate(toPath(deepLinks.metaDetailsStreams), { replace: true });
                 }
             } else {
-                window.history.back();
+                navigate(-1);
             }
+
         } else {
             if (deepLinks.player) {
-                isNavigating.current = true;
-                window.location.replace(deepLinks.player);
+                navigate(toPath(deepLinks.player), { replace: true });
             } else if (deepLinks.metaDetailsStreams) {
-                isNavigating.current = true;
-                window.location.replace(deepLinks.metaDetailsStreams);
+                navigate(toPath(deepLinks.metaDetailsStreams), { replace: true });
             }
         }
     }, []);
 
     const onEnded = React.useCallback(() => {
-        // here we need to explicitly check for isNavigating.current
-        // the ended event can be called multiple times by MPV inside Shell
-        if (isNavigating.current) {
-            return;
-        }
-
         ended();
-        if (window.playerNextVideo !== null) {
+        if (player.nextVideo !== null) {
             nextVideo();
 
-            const deepLinks = window.playerNextVideo.deepLinks;
+            const deepLinks = player.nextVideo.deepLinks;
             handleNextVideoNavigation(deepLinks, profile.settings.bingeWatching, true);
-
         } else {
-            window.history.back();
+            navigate(-1);
         }
-    }, []);
+    }, [player.nextVideo, profile.settings.bingeWatching, handleNextVideoNavigation]);
 
     const onError = React.useCallback((error) => {
         console.error('Player', error);
@@ -452,14 +455,6 @@ const Player = ({ urlParams, queryParams }) => {
                 closeNextVideoPopup();
             }
         }
-        if (player.nextVideo) {
-            // This is a workaround for the fact that when we call onEnded nextVideo from the player is already set to null since core unloads the stream
-            // we explicitly set it to a global variable so we can access it in the onEnded function
-            // this is not a good solution but it works for now
-            window.playerNextVideo = player.nextVideo;
-        } else {
-            window.playerNextVideo = null;
-        }
     }, [player.nextVideo, video.state.time, video.state.duration]);
 
     // Auto audio track selection
@@ -480,9 +475,6 @@ const Player = ({ urlParams, queryParams }) => {
         defaultAudioTrackSelected.current = false;
         nextVideoPopupDismissed.current = false;
         playingOnExternalDevice.current = false;
-        // we need a timeout here to make sure that previous page unloads and the new one loads
-        // avoiding race conditions and flickering
-        setTimeout(() => isNavigating.current = false, 1000);
     }, [video.state.stream]);
 
     React.useEffect(() => {
@@ -539,6 +531,33 @@ const Player = ({ urlParams, queryParams }) => {
             onPauseRequested();
         }
     }, [settings.pauseOnMinimize, platform.shell.state.windowClosed, platform.shell.state.windowHidden]);
+
+    React.useEffect(() => {
+        if (video.state.stream === null || typeof player?.title !== 'string') {
+            discordTimestamps.current = EMPTY_DISCORD_TIMESTAMPS;
+            discord.setActivity(null);
+            return;
+        }
+
+        const metaItem = player.metaItem?.type === 'Ready' ? player.metaItem.content : null;
+        const { activity, timestamps } = getPlaybackDiscordActivity({
+            title: player.title,
+            image: metaItem?.poster || metaItem?.background || null,
+            paused: video.state.paused,
+            time: video.state.time,
+            duration: video.state.duration,
+            timestamps: discordTimestamps.current,
+        });
+
+        discordTimestamps.current = timestamps;
+        discord.setActivity(activity);
+    }, [discord.setActivity, player?.title, player.metaItem, video.state.duration, video.state.paused, video.state.stream, video.state.time]);
+
+    React.useEffect(() => {
+        return () => {
+            discord.setActivity(null);
+        };
+    }, [discord.setActivity]);
 
     useMediaSession(video.state, player, fullscreen, onPlayRequested, onPauseRequested, onNextVideoRequested);
 
@@ -633,16 +652,16 @@ const Player = ({ urlParams, queryParams }) => {
 
     onShortcut('playNext', () => {
         closeMenus();
-        if (window.playerNextVideo !== null) {
+        if (player.nextVideo !== null) {
             nextVideo();
-            const deepLinks = window.playerNextVideo.deepLinks;
+            const deepLinks = player.nextVideo.deepLinks;
             handleNextVideoNavigation(deepLinks, false, false);
         }
-    }, []);
+    }, [player.nextVideo, handleNextVideoNavigation]);
 
     onShortcut('exit', () => {
         closeMenus();
-        !settings.escExitFullscreen && window.history.back();
+        !settings.escExitFullscreen && navigate(-1);
     }, [settings.escExitFullscreen]);
 
     React.useLayoutEffect(() => {
@@ -760,7 +779,7 @@ const Player = ({ urlParams, queryParams }) => {
             video.events.off('error', onError);
             video.events.off('ended', onEnded);
         };
-    }, []);
+    }, [onEnded]);
 
     React.useLayoutEffect(() => {
         return () => {
@@ -919,7 +938,7 @@ const Player = ({ urlParams, queryParams }) => {
                     metaItem={player.metaItem?.content}
                     seriesInfo={player.seriesInfo}
                     closeSideDrawer={closeSideDrawer}
-                    selected={player.selected?.streamRequest?.path.id}
+                    selected={player.selected?.streamRequest?.path?.id}
                 />
             </Transition>
             <Transition when={subtitlesMenuOpen} name={'fade'}>
@@ -954,18 +973,6 @@ const Player = ({ urlParams, queryParams }) => {
             </Transition>
         </div>
     );
-};
-
-Player.propTypes = {
-    urlParams: PropTypes.shape({
-        stream: PropTypes.string,
-        streamTransportUrl: PropTypes.string,
-        metaTransportUrl: PropTypes.string,
-        type: PropTypes.string,
-        id: PropTypes.string,
-        videoId: PropTypes.string
-    }),
-    queryParams: PropTypes.instanceOf(URLSearchParams)
 };
 
 const PlayerFallback = () => (
